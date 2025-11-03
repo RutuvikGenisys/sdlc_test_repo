@@ -1,0 +1,68 @@
+name: CI/CD Pipeline for Streamlit App
+
+on: 
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1 # e.g., us-east-1
+  ECR_REPOSITORY: streamlit-app # Name of your ECR repository
+  ECS_SERVICE: streamlit-app-service # Name of your ECS service
+  ECS_CLUSTER: default # Name of your ECS cluster
+  ECS_TASK_DEFINITION: task-definition.json # Path to your ECS task definition file
+
+permissions:
+  id-token: write # This is required for requesting the JWT
+  contents: read # This is required for checkout
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: arn:aws:iam::YOUR_AWS_ACCOUNT_ID:role/github-actions-oidc-role # Replace with your IAM Role ARN
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build, tag, and push image to Amazon ECR
+      id: build-image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f containerization/Dockerfile .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        echo "image_uri=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+    - name: Download task definition
+      run: |
+        aws ecs describe-task-definition --task-definition ${{ env.ECS_TASK_DEFINITION | sed 's/.json//g' }} --query taskDefinition > ${{ env.ECS_TASK_DEFINITION }}
+
+    - name: Fill in the new image ID in the Amazon ECS task definition
+      id: render-task-definition
+      uses: aws-actions/amazon-ecs-render-task-definition@v1
+      with:
+        task-definition: ${{ env.ECS_TASK_DEFINITION }}
+        container-name: streamlit-container # This should match the container name in your task definition
+        image: ${{ steps.build-image.outputs.image_uri }}
+
+    - name: Deploy Amazon ECS task definition
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+      with:
+        task-definition: ${{ steps.render-task-definition.outputs.task-definition }}
+        service: ${{ env.ECS_SERVICE }}
+        cluster: ${{ env.ECS_CLUSTER }}
+        wait-for-service-stability: true
+
+    - name: Cleanup Image Cache
+      run: docker system prune -f
